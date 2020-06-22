@@ -1,40 +1,121 @@
 import streamlit as st
+import streamlit.ReportThread as ReportThread
+from streamlit.server.Server import Server
 import numpy as np
 import pandas as pd
 import plotly.express as px
-import datetime
 from sklearn import tree, ensemble
 from sklearn.ensemble import RandomForestClassifier
+from sklearn import calibration
 import pickle
 from PIL import Image, ImageOps
+import skimage
+from skimage import io
 import requests
 from io import BytesIO
 import difflib
 import pytesseract
 import re
-
-import skimage
-from skimage import io
-
-import streamlit.ReportThread as ReportThread
-from streamlit.server.Server import Server
+import datetime
 import time
 import functools
 import random
 import string
-from sklearn import calibration
+from bisect import bisect_left
 
-
+# We need to specify where tesseract OCR is installed.
+# When running locally, use something like this:
 #pytesseract.pytesseract.tesseract_cmd = r'D:\Software\Tesseract-OCR\tesseract.exe'
+# Otherwise, use this:
 pytesseract.pytesseract.tesseract_cmd = '/app/.apt/usr/bin/tesseract'
 
+def main():
+    # Run this so that models are cached
+    two_week_model, one_month_model = load_models()
 
-# these next two functions were copied from 
+    # Show some information in the sidebar
+    st.sidebar.info(
+        "Created by Zeke Barger, "
+        "Insight Data Science Fellow.\n\n"
+        "For more information, see the project [GitHub]("
+        "http://code.book-drop.site) and "
+        "[Slides](http://slides.book-drop.site).\n\n"
+        "To get started, try dragging and dropping "
+        "these links into the search bar:\n\n"
+        "[*1984*, by George Orwell](https://www.amazon.com/"
+        "1984-Signet-Classics-George-Orwell/dp/0451524934/ref=sr_1_1?dchild=1)\n\n"
+        "[*The Handmaid's Tale*, by Margaret Atwood](https://www.amazon.com/dp/038"
+        "549081X?tag=camelproducts-20&linkCode=ogi&th=1&psc=1&language=en_US)\n\n"
+        "[*East of Eden*, by John Steinbeck](https://www.amazon.com/dp/0140186395"
+        "?tag=camelproducts-20&linkCode=ogi&th=1&psc=1&language=en_US)"
+    )
+
+    # Create the main components of the interface
+    st.title('BookDrop')
+    st.subheader(
+        "Enter a book's Amazon URL to find out whether the "
+        "price is likely to drop by at least 10% in the next..."
+    )
+    timeframe = st.radio("",('two weeks', 'month'))
+    product_url = st.text_input('', value='', key='asinstr', type='default')
+    
+    # Extract the ASIN from the product URL
+    asin = get_asin(product_url)
+
+    # If an ASIN was found, try to collect the price history
+    if asin is not None:
+        features, history = collect_data(asin)
+
+        # If there was some proble, display an error message
+        if features is None:
+            st.subheader('Sorry, that product was not found or was released too recently.')
+            
+        else:    
+            # Use the relevant model to make a prediction
+            # Note: the decision thresholds are no longer 0.5 because
+            # the models have been calibrated
+            if timeframe == 'two weeks':
+                drop_probability = two_week_model.predict_proba([features])[0][1]
+                drop_predicted = drop_probability > 0.12247253
+            else:
+                drop_probability = one_month_model.predict_proba([features])[0][1]
+                drop_predicted = drop_probability > 0.19920479
+        
+            # Display information about the prediction
+            if drop_predicted:
+                st.subheader(
+                    "Don't buy! The price has a "+str(np.round(100*drop_probability))+ \
+                    "% chance of dropping in the next "+timeframe+"."
+                )
+                st.write('Set your price tracker here:')
+                st.write('https://camelcamelcamel.com/product/'+asin+"?active=price_amazon#watch")
+            else:
+                st.subheader(
+                    "Go for it! The price only has a "+str(np.round(100*drop_probability))+ \
+                    "% chance of dropping in the next "+timeframe+"."
+                )
+
+            # Select just the last year (at most) of the price history to plot
+            start_idx = np.max(np.array([(-1*len(history.index)), -365*2]))
+            df_to_plot = history.iloc[start_idx:].copy()
+            # Plot the price history
+            fig = px.line(df_to_plot, x='date', y = 'price',
+                title='Price history, last '+str(int(-1*round(start_idx/2/30.5)))+' months')
+            fig.update_yaxes(tickprefix="$",tickformat='.2f')
+            fig.update_layout(xaxis_title="Date",yaxis_title="Price",)
+            st.plotly_chart(fig, use_container_width=True)
+    else:
+        # If something was entered, but no ASIN was found
+        if len(product_url) > 0:
+            st.write('Please enter a valid URL.')
+
+# The functions get_session_id and fancy_cache were copied from 
 # https://gist.github.com/treuille/f988f78c4610c78322d089eb77f74598
-# and allow one to cache for a limited period of time
-# Copied from tvst's great gist:
-# https://gist.github.com/tvst/6ef6287b2f3363265d51531c62a84f51
+# and allow one to cache for a limited period of time only.
+# This is useful because camelcamelcamel updates about every 6 hours.
 def get_session_id():
+    # Copied from tvst's great gist:
+    # https://gist.github.com/tvst/6ef6287b2f3363265d51531c62a84f51
     # Hack to get the session object from Streamlit.
 
     ctx = ReportThread.get_report_ctx()
@@ -110,259 +191,302 @@ def fancy_cache(func=None, ttl=None, unique_to_session=False, **cache_kwargs):
     return fancy_cached_func
 
 
-def get_prices(asin,prog):
+# Only keep this cached for 3 hours, max
+@fancy_cache(ttl=60*60*3,show_spinner=False,suppress_st_warning=True)
+def collect_data(asin):
+    """ 
+    Get the price history of an item from Amazon, supplementing
+    this with 3rd-party data if needed.
+  
+    Parameters: 
+    asin (str): Amazon Standard Identification Number for an item.
+  
+    Returns: 
+    features: numpy array of features of the price history that can 
+        be used as inputs to a trained random forest classifier
+    history: A pandas dataframe of the item's price at 12-hours
+        time resolution, collected from camelcamelcamel.com
+    """
+    # Set the size of the image to be downloaded. Larger sizes
+    # will product more accurate results at the cost of 
+    # increased processing time.
     image_width = 6555
     image_height = 1013
 
-    # get the URL to the data
-    url_a = 'https://charts.camelcamelcamel.com/us/' + asin + \
+    # get the URL to the camelcamelcamel page
+    url_amazon = 'https://charts.camelcamelcamel.com/us/' + asin + \
     '/amazon.png?force=0&zero=1&w='+str(image_width)+'&h='+str(image_height)+\
     '&desired=false&legend=0&ilt=1&tp=all&fo=0&lang=en'
 
-    url_3 = 'https://charts.camelcamelcamel.com/us/' + asin + \
+    url_3rdparty = 'https://charts.camelcamelcamel.com/us/' + asin + \
     '/new.png?force=0&zero=1&w='+str(image_width)+'&h='+str(image_height)+\
     '&desired=false&legend=0&ilt=1&tp=all&fo=0&lang=en'
 
-
-    da, pa, prog = url2price(url_a, image_width, image_height, prog)
+    # Extract price data for times when the item was sold by Amazon
+    dates_amazon, prices_amazon = scrape_prices(url_amazon, image_width, image_height)
     
-    # only check 3rd-party prices if amazon data is missing
-    if da is None or np.size(da) < 60 or np.all(np.isnan(pa[-60:])) or np.sum(np.isnan(pa))/np.size(da) > .1:
-        d3, p3, prog = url2price(url_3, image_width, image_height, prog)
+    # If the price data are insufficient, collect data from times 
+    # when the item was sold by a 3rd party through Amazon
+    if dates_amazon is None or \
+       np.size(dates_amazon) < 60 or \
+       np.all(np.isnan(prices_amazon[-60:])) or \
+       np.sum(np.isnan(prices_amazon))/np.size(dates_amazon) > .1:
+       
+        # Extract price data for times when the item was sold by a 3rd party
+        dates_3rdparty, prices_3rdparty = scrape_prices(url_3rdparty, image_width, image_height)
 
-        if da is not None and d3 is not None:
-            dates = np.union1d(da, d3)
+        # If we have both types of price data
+        if dates_amazon is not None and dates_3rdparty is not None:
+            # Find the union of the two date ranges
+            dates = np.union1d(dates_amazon, dates_3rdparty)
             prices_padded = np.ones((np.size(dates), 2)) * np.nan
-            idx_a = int(np.where(dates == da[0])[0])
-            idx_3 = int(np.where(dates == d3[0])[0])
-            prices_padded[idx_a:(idx_a + np.size(pa)), 0] = pa
-            prices_padded[idx_3:(idx_3 + np.size(p3)), 1] = p3
-
+            # Align the price data in time
+            idx_a = int(np.where(dates == dates_amazon[0])[0])
+            idx_3 = int(np.where(dates == dates_3rdparty[0])[0])
+            prices_padded[idx_a:(idx_a + np.size(prices_amazon)), 0] = prices_amazon
+            prices_padded[idx_3:(idx_3 + np.size(prices_3rdparty)), 1] = prices_3rdparty
+            # Fill in gaps in Amazon prices with 3rd party prices
             prices = np.copy(prices_padded[:, 0])
             nan_a = np.isnan(prices)
             prices[nan_a] = prices_padded[nan_a, 1]
-            # except the last entry for safety
+            # Sometimes the date ranges are different, so make sure
+            # we keep the most recent Amazon prices just in case.
+            # This solution will be problematic if there are no Amazon prices
+            # available recently and the 3rd party price changed significantly
+            # in the last 36 hours.
             prices[-3:]=prices_padded[-3:, 0]
 
         else:
-            if da is not None:
-                dates = da
-                prices = pa
+            # If we only have Amazon prices, use them 
+            if dates_amazon is not None:
+                dates = dates_amazon
+                prices = prices_amazon
             else:
-                if d3 is not None:
-                    dates = d3
-                    prices = p3
+                # If we only have 3rd party prices, use them
+                if dates_3rdparty is not None:
+                    dates = dates_3rdparty
+                    prices = prices_3rdparty
                 else:
-                    return
+                    # No data were found
+                    return None, None
     else:
-        if da is not None:
-            dates = da
-            prices = pa
-    # impute nans and convert to dataframe
+        # Since the Amazon data had no problems, use them
+        dates = dates_amazon
+        prices = prices_amazon
+
+    # Impute nans
     prices = impute_nan(prices)
-    df = pd.DataFrame({'date': dates, 'price': prices})
+    # Convert the price history to a dataframe
+    history = pd.DataFrame({'date': dates, 'price': prices})
+    # Extract features for the classifier
+    features = compute_features(history)
+    
+    return features, history
 
-    return df
 
-
-def url2price(url, image_width, image_height, prog, verbose=False):
-    #st.write('fetching image')
-    # define colors of the lines in the plot
-    # red, green, blue
-
+def scrape_prices(url, image_width, image_height):
+    """ 
+    Extract dates and prices from a camelcamelcamel item URL.
+  
+    Parameters: 
+    url (str): camelcamelcamel URL for a product.
+    image_width (int): width of the image to be used, in pixels
+    image_height (int): height of the image to be used, in pixels
+  
+    Returns: 
+    dates: numpy array of dates at 12-hour intervals
+    prices: a numpy array of prices
+    """
+    
+    ################
+    # Collect data #
+    ################
+    
+    # Show a message indicating progress
+    progress_string = st.text('Collecting data...')
+    
+    # Define colors of elements of the plot (RGB)
+    # Plotted lines
     plot_colors = np.array([[194, 68, 68], [119, 195, 107], [51, 51, 102]])
+    # Gray axis lines
     gray = np.array([215, 215, 214])
+    # Black axis lines
     black = np.array([75, 75, 75])
 
-    # download the image
+    # Download the image
     response = requests.get(url)
     image_temp = Image.open(BytesIO(response.content))
 
-    # convert image to float
+    # Convert image to float
     im = np.array(image_temp)
 
-    # get masks for each plot color
+    # Get masks for each plot color
     masks = list()
     for i in range(3):
         masks.append(np.all(im == plot_colors[i], axis=-1))
 
-    # check if there's no data
+    # Check if there image is empty (camel has no data)
     if not np.any(masks[1]):
-        return None, None, prog
+        return None, None
 
-    prog += .125
-    prog_bar.progress(prog)
+    ######################
+    # Find x and y scale #
+    ######################
 
-    #st.write('aligning image')
-    # find the y axis upper limit
-    # off by 1?
+    progress_string.text('Aligning data...')
+    
+    # Find the y axis upper limit
+    # Crop a portion of the image containing the top of the grid
     top_line_crop = im[:,
                        round(image_width * .5) - 5:round(image_width * .5) +
                        6, :]
-    # off by 1?
+    # Get the position of the line
     line_y_value = find_line(top_line_crop, gray)
-    # if it wasn't found, quit
+    
+    # If it wasn't found, quit
+    # Checks of this nature are rarely needed, as long
+    # as camel keeps their plotting code the same
     if line_y_value is None:
-        if verbose:
-            print('could not find y axis')
-        return None, None, prog
+        return None, None
     else:
         line_y_value = int(line_y_value)
 
-    # find x axis limits
-    # off by 1?
+    # Find x axis limits
+    # Crop the left-most and right-most vertical lines in the grid
     left_line_crop = np.transpose(
         im[round(image_height * .5) - 8:round(image_height * .5) +
            9, :round(image_width * .1), :],
         axes=[1, 0, 2])
-    # off by 1?
     right_line_crop = np.transpose(im[round(image_height * .5) -
                                       8:round(image_height * .5) + 9,
                                       round(image_width * .7):, :],
                                    axes=[1, 0, 2])
-    # off by 1?
     lo_x_value = find_line(left_line_crop, black)
-    # off by 1?
     hi_x_value = find_line(right_line_crop[::-1, :, :], gray)
     if lo_x_value is None or hi_x_value is None:
-        if verbose:
-            print('could not find x axis')
-        return None, None, prog
+        return None, None
     else:
         lo_x_value = int(lo_x_value)
         hi_x_value = int(hi_x_value)
 
-    # find value of y axis upper limit
-    # first, crop the price out
-    # off by 1?
+    # Find price corresponding to the y axis upper limit
+    # First, crop the price text
     upper_price_crop = im[line_y_value - 8:line_y_value + 10,
                           0:lo_x_value - 9, :]
     upper_price_crop = Image.fromarray(upper_price_crop)
+    # Resize and apply OCR
     upper_price_crop = upper_price_crop.resize(
         (upper_price_crop.width * 12, upper_price_crop.height * 12))
     upper_price_string = pytesseract.image_to_string(upper_price_crop)
     upper_price = float(upper_price_string[1:].replace(',', ''))
-    if verbose:
-        print('price guess')
-        print(upper_price)
 
-    # store y position of price limits
-    # off by 1?
+    # Store y position of price limits
+    # The position and price of the lower limit are constant
     limit_y_positions = np.array([line_y_value, image_height - 49])
 
-    # calculate dollars per pixel
+    # Calculate dollars per pixel
     dollarspp = upper_price / (np.max(limit_y_positions) -
                                np.min(limit_y_positions))
 
-    # crop year from bottom of image
+    # Crop year text from bottom of image so that we
+    # can find the date of the first timepoint
     year_crop = im[-14:, 0:round(image_width / 3), :]
     year_crop = Image.fromarray(year_crop)
+    # Resize and apply OCR
     year_crop = year_crop.resize((year_crop.width * 3, year_crop.height * 3))
     year_string = pytesseract.image_to_string(year_crop)
     year_string = year_string[:4]
 
-    # crop month and day from bottom left corner
-    # initial crop
+    # Crop month and day from bottom left corner
     date_crop = im[-44:-14, (lo_x_value - 40):(lo_x_value + 6), :]
-    # convert to image
+    # Convert to image
     date_crop = Image.fromarray(date_crop)
-    # invert, so that rotation works
+    # Invert, so that rotation works
     date_crop = ImageOps.invert(date_crop)
-    # pad
+    # Pad the image
     date_crop_padded = Image.new(
         'RGB', (round(date_crop.width * 1.5), round(date_crop.height * 1.5)),
         (0, 0, 0))
     date_crop_padded.paste(date_crop, box=(0, round(date_crop.height * .5)))
-    # resize
+    # Resize
     date_crop_padded = date_crop_padded.resize(
         (date_crop_padded.width * 7, date_crop_padded.height * 7),
         resample=Image.LANCZOS)
-    # rotate and invert
+    # Rotate and invert
     date_crop_padded = ImageOps.invert(date_crop_padded.rotate(-45))
+    # Apply OCR
     date_string = pytesseract.image_to_string(date_crop_padded)
-    if verbose:
-        print('date string')
-        print(date_string)
-    # find closest match to month
+    # Find closest match to a month
     start_month = difflib.get_close_matches(date_string, [
         'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct',
         'Nov', 'Dec'
     ],
                                             n=1,
                                             cutoff=0.2)
+    # Quit if no month was found
     if np.size(start_month) < 1:
-        if verbose:
-            print('could not identify month')
-        return None, None, prog
+        return None, None
 
     start_month = start_month[0]
-    if verbose:
-        print('month guess')
-        print(start_month)
 
-    # get day
-    # try to fix 0-o mixups
+    # Get the day of the first timepoint
+    # Try to fix mixups between 'o' and 0
     if date_string[-1] == 'o':
         date_string = date_string[:-1] + '0'
-    # remove all whitespace
+    # Remove all whitespace
     date_string_stripped = "".join(date_string.split())
-    # take last 2 digits if the second-to-last is reasonable
+    # Take last 2 digits if the second-to-last is reasonable
     if date_string_stripped[-2].isdigit() and 0 < int(
             date_string_stripped[-2]) < 4:
         start_day = date_string_stripped[-2:]
     else:
         start_day = '0' + date_string_stripped[-1]
-    if verbose:
-        print('day guess')
-        print(start_day)
 
-    # x axis locations of time limits
-    # again... pretty sure one of these is off by 1.
+    # Store x axis locations of time limits
     limit_x_positions = [lo_x_value, image_width - hi_x_value]
 
-    # check if our date is valid
+    # Check if our date is valid
     try:
         start_time = datetime.datetime.strptime(
             start_month + start_day + year_string, '%b%d%Y')
     except ValueError:
-        if verbose:
-            disp('invalid date')
-        return None, None, prog
+        return None, None
 
-    # get current time
+    # Get current time
     end_time = datetime.datetime.now()
 
-    # calculate days per pixel
+    # Calculate days per pixel
     time_delta = end_time - start_time
     dayspp = time_delta.days / int(1 + np.diff(limit_x_positions))
 
-    # get number of observations
+    # Get number of observations
     num_obs = int(np.diff(limit_x_positions))
-    #     print('number of observations:')
-    #     print(num_obs)
 
-    # preallocate prices as nan
+    # Preallocate prices as nan
     prices = np.ones(num_obs) * np.nan
     
-    prog += .125
-    prog_bar.progress(prog)
+    ##################
+    # Extract prices #
+    ##################
     
-    #st.write('scanning image')
+    progress_string.text('Extracting prices...')
 
-    # find y-axis value of blue pixels in each time step
+    # Find y-axis value of blue pixels in each time step - 
+    # these are the prices we're looking for
     y = [[i for i, x in enumerate(q) if x] for q in np.transpose(
         masks[2][:, limit_x_positions[0]:limit_x_positions[1]])]
 
-    # adjust values if necessary, then convert to prices
+    # Adjust values if necessary, then convert to prices
+    # Missing data are set to nan
     for i in range(num_obs):
-        # check if the bottom of the blue line is covered by a red or green line
+        # Check if the bottom of the blue line is covered by a red or green line
         if np.size(y[i]) == 1:
             if masks[0][int(y[i][0]) + 1, limit_x_positions[0] +
                         i] or masks[1][int(y[i][0]) + 1,
                                        limit_x_positions[0] + i, ]:
                 y[i][0] += 1
 
-        # check if the blue line is covered by both red and green lines
+        # Check if the blue line is covered by both red and green lines
         if np.size(y[i]) == 0:
             red_idx = [
                 q for q, x in enumerate(masks[0][:, limit_x_positions[0] + i])
@@ -380,24 +504,31 @@ def url2price(url, image_width, image_height, prog, verbose=False):
 
         prices[i] = dollarspp * (image_height - np.max(y[i]) - 50)
 
-    # adjust periods with no data
-    # first, find nans and convert to a str for regex searching
+    # Adjust periods with no data
+    # First, find nans and convert to a str for regex searching
     nans = ''.join([str(int(np.isnan(i))) for i in prices])
-    # ensure the beginnings of empty periods are correct
+    # Ensure the beginnings of empty periods are correct
     matches = [m.span() for m in re.finditer('000110011', nans)]
     for match in matches:
         prices[match[0] + 3:match[0] + 5] = prices[match[0] + 5]
-    # then remove empty periods
+    # Then remove empty periods
     nans = ''.join([str(int(np.isnan(i))) for i in prices])
     matches = [m.span() for m in re.finditer('1100', nans)]
     for match in matches:
         prices[match[0] + 2:match[0] + 4] = np.nan
 
-    # resample to 2x daily observations at 6:00 and 18:00
-    # date and time of each observation
+
+    ###################
+    # Resample prices #
+    ###################
+
+    progress_string.text('Resampling prices...')
+
+    # Resample to 2x daily observations at 6:00 and 18:00
+    # First, get the dates of our observations
     dates = pd.date_range(start_time, end_time,
                           periods=num_obs).to_pydatetime()
-
+    # Initialize new dates and prices at the desired interval
     dates_2x_daily = pd.date_range(datetime.datetime(start_time.year,
                                                      start_time.month,
                                                      start_time.day, 6),
@@ -405,42 +536,73 @@ def url2price(url, image_width, image_height, prog, verbose=False):
                                                      end_time.month,
                                                      end_time.day, 18),
                                    freq='12H').to_pydatetime()
-
-    
-    prog += .125
-    prog_bar.progress(prog)
-    
-    #st.write('resampling timepoints')
-    # find closest price to each timepoint
     prices_2x_daily = np.ones(np.size(dates_2x_daily)) * np.nan
-    # very slow...
+    
+    # Find price at the closest date to each timepoint
     for i in range(np.size(dates_2x_daily)):
-        old_date = np.argmin(np.abs(dates - dates_2x_daily[i]))
-        prices_2x_daily[i] = prices[old_date]
+        prices_2x_daily[i] = prices[take_closest_date(dates-dates_2x_daily[i])]
 
-    # make sure most recent price is correct
+    # Make sure most recent price is correct
     prices_2x_daily[-1] = prices[-1]
+    # Round prices to 2 decimal places
     prices_2x_daily = np.around(prices_2x_daily, 2)
 
-    prog += .125
-    prog_bar.progress(prog)
-    #st.write('last 4 p2xd')
-    #st.write(prices_2x_daily[-4:])
+    # Clear the message
+    progress_string.empty()
+    
+    return dates_2x_daily, prices_2x_daily
 
-    return dates_2x_daily, prices_2x_daily, prog
+# This function is a modified version of the one posted by 
+# Lauritz V. Thaulow on stackoverflow at
+# https://stackoverflow.com/a/12141511
+def take_closest_date(myList):
+    """
+    Assumes myList is sorted. Returns index of closest value to myNumber.
+
+    If two numbers are equally close, return the index of the smallest number.
+    """
+    pos = bisect_left(myList, datetime.timedelta(0))
+    if pos == 0:
+        return 0
+    if pos == len(myList):
+        return len(myList)-1
+    before = myList[pos - 1]
+    after = myList[pos]
+    if abs(after) < abs(before):
+       return pos
+    else:
+       return pos - 1
 
 
 def find_line(img, c):
+    """ 
+    Find the position of a line that bisects an image horizontally. 
+    If there are multiple lines, only the first is returned.
+  
+    Parameters: 
+    img (float): numpy array containing the image to search.
+    c (float): 3-element numpy array equal to the line's color.
+  
+    Returns: 
+    int: Location of the line, in pixels from the top of the image.
+  
+    """
+    # Colors in the image should be withing this range of the target
     color_tolerance = 15
+    # This fraction of the image should contain matching colors
+    # to be considered a line
     match_threshold = .75
-    im_width = np.size(img, 1)
-    # find pixels within tolerance
-    img[img < c - color_tolerance] = 0
-    img[img > c + color_tolerance] = 0
+    # Get the width of the image, in pixels
+    img_width = np.size(img, 1)
+    # Find all pixels within color tolerance
+    img[(img < c - color_tolerance) | (img > c + color_tolerance)] = 0
     img[img > 0] = 1
+    # Only take pixels where all channels are within color tolerance
     mask2d = np.all(img, axis=-1)
+    # Sum across columns
     sums = np.sum(mask2d, axis=1)
-    matches = np.argwhere(sums > match_threshold * im_width)
+    # Find rows with sufficient matches
+    matches = np.argwhere(sums > match_threshold * img_width)
     if np.size(matches) < 1:
         return
     else:
@@ -448,176 +610,158 @@ def find_line(img, c):
 
 
 def impute_nan(x):
+    """ 
+    Impute nan values in a series of prices using most recent non-nan values.
+  
+    Parameters: 
+    x (numpy array): A series of prices.
+  
+    Returns: 
+    Array with nan values imputed.
+    """
+    # Convert result of isnan to a string for regex searching
     nans = ''.join([str(int(np.isnan(i))) for i in x])
+    # Find groups of nans
     matches = [m.span() for m in re.finditer('0[^0]+', nans)]
+    # Replace each with most recent non-nan value
     for match in matches:
         x[match[0] + 1:match[1]] = x[match[0]]
     return x
 
 
 def scale_prices(pr):
-    # calculate 5th and 95th percentiles
+    """ 
+    Scale prices by the 5th and 95th percentiles.
+    This is similar to min-max scaling.
+  
+    Parameters: 
+    pr : numpy array of prices
+  
+    Returns: 
+    scaled numpy array of prices
+    """
+    # Calculate 5th and 95th percentiles
     prctiles = np.quantile(pr,[.05, .95])
-    # if this range is very small, use a reasonable guess instead
+    # If this range is very small, use a reasonable guess instead
     median_to_date = np.median(pr)
     if prctiles[1] - prctiles[0] < .02 * median_to_date:
         prctiles[0] = .5 * median_to_date
         prctiles[1] = 1.5 * median_to_date
 
-    # scale the prices
+    # Scale the prices
     pr_scaled = (pr - prctiles[0]) / (prctiles[1] - prctiles[0])
-    # set upper and lower bounds
+    # Set upper and lower bounds
     pr_scaled[pr_scaled > 2] = 2
     pr_scaled[pr_scaled < -1] = -1
     
     return pr_scaled
 
 
-def df2feats(df):
-    past = 120
+def compute_features(df):
+    """ 
+    Compute informative features of an item's price history.
+  
+    Parameters: 
+    df (DataFrame): a dataframe of dates and prices
+  
+    Returns: 
+    numpy array of features
+    """
+    
+    # Number of timepoints considered 'recent'
+    recent = 120
+    # Fraction of the price considered a 'drop'
+    # E.g., 0.1 for a 10% price drop
     drop_frac = .1
-    X = list([])
-    # drop missing values
+
+    # Drop missing values
     df.dropna(inplace=True)
-    # convert to array
+    # Convert to array
     pr = np.array(df['price'])
     
-    # current price, in dollars
-    current_p = pr[-1]
+    # Current price, in dollars
+    current_price = pr[-1]
 
-    # prices scaled by historical high and low
+    # Prices scaled by historical high and low
     prices_scaled = scale_prices(pr)
 
-    # current scaled price
+    # Current scaled price
     current_scaled = prices_scaled[-1]
 
-    # find current price scaled by recent prices, rather than all-time
-    recent_prices_scaled = scale_prices(pr[-1 * past:])
-    # get the current value
+    # Find current price scaled by recent prices, rather than all-time
+    recent_prices_scaled = scale_prices(pr[-1 * recent:])
+    # Get the current value
     current_scaled_recent = recent_prices_scaled[-1]
 
-    # median scaled price, recently
-    median_scaled = np.median(prices_scaled[-1 * past:])
+    # Median scaled price, recently
+    median_scaled = np.median(prices_scaled[-1 * recent:])
 
-    # standard deviation of recent scaled prices
-    std_recent = np.std(prices_scaled[-1 * past:])
+    # Standard deviation of recent scaled prices
+    std_recent = np.std(prices_scaled[-1 * recent:])
 
-    # probability that recent prices were equal to current price
-    p_equal = np.sum(pr[-1 * past:] == current_p) / past
+    # Probability that recent prices were equal to current price
+    p_equal = np.sum(pr[-1 * recent:] == current_price) / recent
 
-    # probability of any price change, all-time
+    # Probability of any price change, all-time
     p_change = np.sum(np.abs(np.diff(pr)) > 0) / np.size(pr)
 
-    # probability of any price change, recently
-    p_change_recent = np.sum(np.abs(np.diff(pr[-1 * past:])) > 0) / past
+    # Probability of any price change, recently
+    p_change_recent = np.sum(np.abs(np.diff(pr[-1 * recent:])) > 0) / recent
 
-    # probability that price has been below the threshold, all-time
-    p_below = np.sum(pr < (1 - drop_frac) * current_p) / np.size(pr)
+    # Probability that price has been below the threshold, all-time
+    p_below = np.sum(pr < (1 - drop_frac) * current_price) / np.size(pr)
 
-    # probability that price has been below the threshold, recently
+    # Probability that price has been below the threshold, recently
     p_below_recent = np.sum(
-        pr[-1 * past:] < (1 - drop_frac) * current_p) / past
+        pr[-1 * recent:] < (1 - drop_frac) * current_price) / recent
 
-    # time elapsed since the last time the price dropped below
+    # Time elapsed since the last time the price dropped below
     # the threshold, divided by total time elapsed
-    # first, find indices of timepoints when the price was below threshold
-    belowpricesidx = np.argwhere(pr[:-1] < (1 - drop_frac) * current_p)
-    # if none were found, the value is 1
+    # First, find indices of timepoints when the price was below threshold
+    belowpricesidx = np.argwhere(pr[:-1] < (1 - drop_frac) * current_price)
+    # If none were found, the value is 1
     if np.size(belowpricesidx) == 0:
         time_since_drop = 1
     else:
         time_since_drop = belowpricesidx[-1].astype(int)[0] / np.size(pr)
 
-    # take the log of some skewed features
+    # Take the log of some skewed features
     time_since_drop = np.log(1.05 + -1 * time_since_drop)
     p_below_recent = np.log(.05 + p_below_recent)
     p_change = np.log(.05 + p_change)
     p_change_recent = np.log(.05 + p_change_recent)
     std_recent = np.log(.05 + std_recent)
 
-    # return the feature vector
+    # Return the feature vector
     return np.array([
         p_equal, p_change_recent, p_below_recent, median_scaled,
         current_scaled_recent, std_recent, current_scaled, time_since_drop,
         p_change, p_below
     ])
 
+def get_asin(url):
+    """ 
+    Extract the ASIN from an Amazon product URL.
+  
+    Parameters: 
+    url (str): Amazon URL for a product.
+  
+    Returns: 
+    str: the ASIN
+    """
+    match = re.search(r"/dp/([^/?]+)",url)
+    if match:
+        return match.group(1)
+    else:
+        return None
 
-
-# load models
+# Load the random forest models
 @st.cache(allow_output_mutation=True,show_spinner=False)
 def load_models():
-    #st.write('loading models')
-    rfmodel28 = pickle.load(open('RFmodel28.sav', 'rb'))
-    rfmodel60 = pickle.load(open('RFmodel60.sav', 'rb'))
-    return rfmodel28, rfmodel60
-
-#@st.cache(show_spinner=False)
-# only keep this cached for 3 hours, max
-@fancy_cache(ttl=60*60*3,show_spinner=False)
-def predict_future(asin,prog):
-    df = get_prices(asin,prog)
-    if df is None:
-        return None, None
-    x = df2feats(df)
-
-    return x, df
+    two_week_model = pickle.load(open('RFmodel28.sav', 'rb'))
+    one_month_model = pickle.load(open('RFmodel60.sav', 'rb'))
+    return two_week_model, one_month_model
 	
 
-# run this so that models are cached
-rfmodel28, rfmodel60 = load_models()
-
-
-st.sidebar.info(
-
-    "[GitHub]("
-    "https://github.com/zekebarger/BookDrop)\n\n"
-    "[Slides]("
-    "https://docs.google.com/presentation/d/1b0i7GQlaIl-ASu68PvatwZ6ZqItuLcHAttV_xMjt5TI/edit?usp=sharing)"
-)
-
-st.title('BookDrop')
-
-st.subheader('Enter a book\'s ASIN (Amazon Standard Identification Number) to find out whether the price is likely to drop by at least 10% in the next...')
-timeframe = st.radio("",('two weeks', 'month'))
-
-isbn = st.text_input('', value='', key='isbnstr', type='default').strip() #,max_chars=10
-
-if len(isbn)==10:
-    prog_bar = st.progress(0)
-    prog = 0
-    x, df = predict_future(isbn,prog)
-    prog_bar.empty()
-    
-    if x is None:
-        st.write('Sorry, that ASIN was not found or is invalid.')
-        
-    else:    
-        if timeframe == 'two weeks':
-            prob = rfmodel28.predict_proba([x])[0][1]
-            yp = prob > 0.12247253
-        else:
-            prob = rfmodel60.predict_proba([x])[0][1]
-            yp = prob > 0.19920479
-    
-        if yp:
-            st.subheader('Don\'t buy! The price has a '+str(np.round(100*prob))+'% chance of dropping in the next '+timeframe+'.')
-            st.write('Set your price tracker here:')
-            st.write('https://camelcamelcamel.com/product/'+isbn+"?active=price_amazon#watch")
-        else:
-            st.subheader('Go for it! The price only has a '+str(np.round(100*prob))+'% chance of dropping in the next '+timeframe+'.')
-
-        start_idx = np.max(np.array([(-1*len(df.index)), -365*2]))
-        df2plot = df.iloc[start_idx:].copy()
-    
-        fig = px.line(df2plot, x='date', y = 'price',title='Price history, last '+str(int(-1*round(start_idx/2/30.5)))+' months')
-    
-        fig.update_yaxes(tickprefix="$")
-        fig.update_yaxes(tickformat='.2f')
-        fig.update_layout(xaxis_title="Date",yaxis_title="Price",)
-        st.plotly_chart(fig, use_container_width=True)
-else:
-    st.write('Examples:')
-    st.write("0451524934 (*1984*, by George Orwell)")
-    st.write("038549081X (*The Handmaid's Tale*, by Margaret Atwoot)")
-    st.write("0140186395 (*East of Eden*, by John Steinbeck)")
+if __name__ == "__main__":
+    main()
