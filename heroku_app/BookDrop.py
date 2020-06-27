@@ -25,9 +25,9 @@ from bisect import bisect_left
 
 # We need to specify where tesseract OCR is installed.
 # When running locally, use something like this:
-#pytesseract.pytesseract.tesseract_cmd = r'D:\Software\Tesseract-OCR\tesseract.exe'
+pytesseract.pytesseract.tesseract_cmd = r'D:\Software\Tesseract-OCR\tesseract.exe'
 # Otherwise, use this:
-pytesseract.pytesseract.tesseract_cmd = '/app/.apt/usr/bin/tesseract'
+#pytesseract.pytesseract.tesseract_cmd = '/app/.apt/usr/bin/tesseract'
 
 def main():
     # Run this so that models are cached
