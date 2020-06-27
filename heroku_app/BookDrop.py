@@ -569,9 +569,9 @@ def take_closest_date(myList):
     before = myList[pos - 1]
     after = myList[pos]
     if abs(after) < abs(before):
-       return pos
+        return pos
     else:
-       return pos - 1
+        return pos - 1
 
 
 def find_line(img, c):
