@@ -1,7 +1,7 @@
 # BookDrop
 A web app that predicts upcoming price drops for books on Amazon.com. 
 
-Click [here](www.book-drop.site) to launch the demo, 
+Click [here](http://www.book-drop.site) to launch the demo, 
 and check out the [slides](http://slides.book-drop.site/)
 for more information.
 
