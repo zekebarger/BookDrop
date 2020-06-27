@@ -1,7 +1,9 @@
 # BookDrop
-A web app that predicts upcoming price drops for books on Amazon.com
+A web app that predicts upcoming price drops for books on Amazon.com. 
 
 See the demo here: www.book-drop.site
+
+For more information, check out the [slides](http://slides.book-drop.site/).
 
 ## How to run the app locally
 You will need to install [Tesseract OCR](https://www.pyimagesearch.com/2017/07/10/using-tesseract-ocr-python/) and modify
