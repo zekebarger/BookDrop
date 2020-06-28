@@ -389,11 +389,11 @@ def scrape_prices(url, image_width, image_height):
 
     # Crop year text from bottom of image so that we
     # can find the date of the first timepoint
-    year_crop = im[-14:, 0:round(image_width / 3), :]
+    year_crop = im[-14:, 0:round(image_width / 8), :]
     year_crop = Image.fromarray(year_crop)
     # Resize and apply OCR
-    year_crop = year_crop.resize((year_crop.width * 3, year_crop.height * 3))
-    year_string = pytesseract.image_to_string(year_crop)
+    year_crop = year_crop.resize((year_crop.width * 5, year_crop.height * 5))
+    year_string = pytesseract.image_to_string(year_crop,config='--psm 7')
     year_string = year_string[:4]
 
     # Crop month and day from bottom left corner
@@ -446,18 +446,19 @@ def scrape_prices(url, image_width, image_height):
     # Store x axis locations of time limits
     limit_x_positions = [lo_x_value, image_width - hi_x_value]
 
+    # For debugging purposes
+    # Useful if CCC changes their plotting code
+    #st.image(year_crop)
+    #st.write(year_string)
+    #st.image(date_crop)
+    #st.image(date_crop_padded)
+
     # Check if our date is valid
     try:
         start_time = datetime.datetime.strptime(
             start_month + start_day + year_string, '%b%d%Y')
     except ValueError:
         return None, None
-        
-    # For debugging purposes
-    # Useful is CCC changes their plotting code
-    #st.image(date_crop)
-    #st.image(date_crop_padded)
-    #st.write(start_time)
 
     # Get current time
     end_time = datetime.datetime.now()
@@ -756,11 +757,17 @@ def get_asin(url):
     Returns: 
     str: the ASIN
     """
+    # Most links are structured like this
     match = re.search(r"/dp/([^/?]+)",url)
     if match:
         return match.group(1)
     else:
-        return None
+        # But some are structured like this
+        match = re.search(r"/gp/product/([^/?]+)",url)
+        if match:
+            return match.group(1)
+        else:
+            return None
 
 # Load the random forest models
 @st.cache(allow_output_mutation=True,show_spinner=False)
