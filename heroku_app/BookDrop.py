@@ -334,7 +334,6 @@ def scrape_prices(url, image_width, image_height):
     ######################
 
     progress_string.text('Aligning data...')
-    
     # Find the y axis upper limit
     # Crop a portion of the image containing the top of the grid
     top_line_crop = im[:,
@@ -398,7 +397,7 @@ def scrape_prices(url, image_width, image_height):
     year_string = year_string[:4]
 
     # Crop month and day from bottom left corner
-    date_crop = im[-44:-14, (lo_x_value - 40):(lo_x_value + 6), :]
+    date_crop = im[-49:-14, (lo_x_value - 40):(lo_x_value + 6), :]
     # Convert to image
     date_crop = Image.fromarray(date_crop)
     # Invert, so that rotation works
@@ -414,6 +413,8 @@ def scrape_prices(url, image_width, image_height):
         resample=Image.LANCZOS)
     # Rotate and invert
     date_crop_padded = ImageOps.invert(date_crop_padded.rotate(-45))
+    # Crop
+    date_crop_padded = date_crop_padded.crop((1,85,297,260))
     # Apply OCR
     date_string = pytesseract.image_to_string(date_crop_padded)
     # Find closest match to a month
@@ -451,6 +452,12 @@ def scrape_prices(url, image_width, image_height):
             start_month + start_day + year_string, '%b%d%Y')
     except ValueError:
         return None, None
+        
+    # For debugging purposes
+    # Useful is CCC changes their plotting code
+    #st.image(date_crop)
+    #st.image(date_crop_padded)
+    #st.write(start_time)
 
     # Get current time
     end_time = datetime.datetime.now()
