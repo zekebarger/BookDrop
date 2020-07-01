@@ -25,13 +25,13 @@ from bisect import bisect_left
 
 # We need to specify where tesseract OCR is installed.
 # When running locally, use something like this:
-pytesseract.pytesseract.tesseract_cmd = r'D:\Software\Tesseract-OCR\tesseract.exe'
+#pytesseract.pytesseract.tesseract_cmd = r'D:\Software\Tesseract-OCR\tesseract.exe'
 # Otherwise, use this:
-#pytesseract.pytesseract.tesseract_cmd = '/app/.apt/usr/bin/tesseract'
+pytesseract.pytesseract.tesseract_cmd = '/app/.apt/usr/bin/tesseract'
 
 def main():
     # Run this so that models are cached
-    two_week_model, one_month_model = load_models()
+    one_month_model, two_month_model = load_models()
 
     # Show some information in the sidebar
     st.sidebar.info(
@@ -56,7 +56,7 @@ def main():
         "Enter a book's Amazon URL to find out whether the "
         "price is likely to drop by at least 10% in the next..."
     )
-    timeframe = st.radio("",('two weeks', 'month'))
+    timeframe = st.radio("",('month', 'two months'))
     product_url = st.text_input('', value='', key='asinstr', type='default')
     
     # Extract the ASIN from the product URL
@@ -74,12 +74,12 @@ def main():
             # Use the relevant model to make a prediction
             # Note: the decision thresholds are no longer 0.5 because
             # the models have been calibrated
-            if timeframe == 'two weeks':
-                drop_probability = two_week_model.predict_proba([features])[0][1]
-                drop_predicted = drop_probability > 0.12247253
-            else:
+            if timeframe == 'month':
                 drop_probability = one_month_model.predict_proba([features])[0][1]
-                drop_predicted = drop_probability > 0.19920479
+                drop_predicted = drop_probability > 0.14295234784705693
+            else:
+                drop_probability = two_month_model.predict_proba([features])[0][1]
+                drop_predicted = drop_probability > 0.2304682764094403
         
             # Display information about the prediction
             if drop_predicted:
@@ -375,8 +375,8 @@ def scrape_prices(url, image_width, image_height):
     upper_price_crop = Image.fromarray(upper_price_crop)
     # Resize and apply OCR
     upper_price_crop = upper_price_crop.resize(
-        (upper_price_crop.width * 12, upper_price_crop.height * 12))
-    upper_price_string = pytesseract.image_to_string(upper_price_crop)
+        (upper_price_crop.width * 10, upper_price_crop.height * 10))
+    upper_price_string = pytesseract.image_to_string(upper_price_crop, config='--psm 7')
     upper_price = float(upper_price_string[1:].replace(',', ''))
 
     # Store y position of price limits
@@ -772,9 +772,9 @@ def get_asin(url):
 # Load the random forest models
 @st.cache(allow_output_mutation=True,show_spinner=False)
 def load_models():
-    two_week_model = pickle.load(open('RFmodel28.sav', 'rb'))
-    one_month_model = pickle.load(open('RFmodel60.sav', 'rb'))
-    return two_week_model, one_month_model
+    one_month_model = pickle.load(open('RFmodel1.sav', 'rb'))
+    two_month_model = pickle.load(open('RFmodel2.sav', 'rb'))
+    return one_month_model, two_month_model
 	
 
 if __name__ == "__main__":
